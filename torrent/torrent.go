@@ -18,21 +18,40 @@ type Torrent struct {
 	Name        string
 }
 
+func (t *Torrent) calculateBoundsForPiece(index int) (begin int, end int) {
+	begin = index * t.PieceLength
+	end = begin + t.PieceLength
+	if end > t.Length {
+		end = t.Length
+	}
+	return begin, end
+}
+
 func (t *Torrent) Download() {
 	logger.Info("starting download", zap.String("name", t.Name))
 
-	for _, peer := range t.Peers {
-		c, err := client.New(&peer, t.InfoHash, t.PeerID)
-		if err != nil {
-			break
+	for i, piece := range t.PieceHashes {
+		begin, end := t.calculateBoundsForPiece(i)
+		p := &client.Piece{
+			Index:  i,
+			Hash:   piece,
+			Length: end - begin,
 		}
 
-		defer c.Conn.Close()
-		logger.Info("completed handshake", zap.Any("peer", peer.GetFullAddress()))
+		for _, peer := range t.Peers {
+			c, err := client.New(&peer, t.InfoHash, t.PeerID)
+			if err != nil {
+				break
+			}
 
-		c.SendMessage(message.Unchoke)
-		c.SendMessage(message.Interested)
+			defer c.Conn.Close()
+			logger.Info("completed handshake", zap.Any("peer", peer.GetFullAddress()))
 
-		c.Bitfield.HasPiece(0)
+			c.SendMessage(message.Unchoke)
+			c.SendMessage(message.Interested)
+
+			c.Bitfield.HasPiece(p.Index)
+			c.TryDownloadPiece(p)
+		}
 	}
 }

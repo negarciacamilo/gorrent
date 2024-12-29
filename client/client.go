@@ -23,7 +23,7 @@ type Client struct {
 }
 
 func New(p *peer.Peer, infoHash, peerId [20]byte) (*Client, error) {
-	conn, err := net.DialTimeout("tcp", p.GetFullAddress(), 3*time.Second)
+	conn, err := net.DialTimeout("tcp", p.GetFullAddress(), 13*time.Second)
 	if err != nil {
 		logger.Error("error establishing connection with peer", zap.Any("peer", p.GetFullAddress()))
 		return nil, err
@@ -53,7 +53,7 @@ func New(p *peer.Peer, infoHash, peerId [20]byte) (*Client, error) {
 }
 
 func performHandshake(conn net.Conn, infoHash, peerId [20]byte) (*handshake.Handshake, error) {
-	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	conn.SetDeadline(time.Now().Add(13 * time.Second))
 	defer conn.SetDeadline(time.Time{})
 
 	h := handshake.Handshake{
@@ -106,12 +106,109 @@ func receiveBitfield(conn net.Conn) (bitfield.Bitfield, error) {
 	return msg.Payload, nil
 }
 
+func (c *Client) Read() (*message.Message, error) {
+	msg, err := message.Read(c.Conn)
+	return msg, err
+}
+
 func (c *Client) SendMessage(id message.ID) error {
 	msg := message.Message{ID: id}
 	_, err := c.Conn.Write(msg.Serialize())
 	if err != nil {
 		logger.Error("error sending message to peer", zap.Any("message", id), zap.Any("peer", c.peer.GetFullAddress()), zap.Error(err))
 		return err
+	}
+	return nil
+}
+
+func (c *Client) SendRequest(index, begin, length int) error {
+	msg := message.FormatRequest(index, begin, length)
+	_, err := c.Conn.Write(msg.Serialize())
+	if err != nil {
+		logger.Error("error sending message to peer", zap.Any("message", msg), zap.Any("peer", c.peer.GetFullAddress()), zap.Error(err))
+		return err
+	}
+	return nil
+}
+
+type Piece struct {
+	Index  int
+	Hash   [20]byte
+	Length int
+}
+
+type pieceProgress struct {
+	index      int
+	client     *Client
+	buf        []byte
+	downloaded int
+	requested  int
+	backlog    int
+}
+
+func (c *Client) TryDownloadPiece(p *Piece) ([]byte, error) {
+	state := pieceProgress{
+		index:  p.Index,
+		client: c,
+		buf:    make([]byte, p.Length),
+	}
+
+	c.Conn.SetDeadline(time.Now().Add(30 * time.Second))
+	defer c.Conn.SetDeadline(time.Time{})
+
+	for state.downloaded < p.Length {
+		if !state.client.Choked {
+			blockSize := 16384
+
+			if p.Length-state.requested < blockSize {
+				blockSize = p.Length - state.requested
+			}
+
+			err := c.SendRequest(p.Index, state.requested, blockSize)
+			if err != nil {
+				return nil, err
+			}
+			state.backlog++
+			state.requested += blockSize
+		}
+
+		err := state.readMessage()
+		if err != nil {
+			return nil, err
+		}
+
+	}
+	return state.buf, nil
+}
+
+func (p *pieceProgress) readMessage() error {
+	msg, err := p.client.Read() // this call blocks
+	if err != nil {
+		return err
+	}
+
+	if msg == nil { // keep-alive
+		return nil
+	}
+
+	switch msg.ID {
+	case message.Unchoke:
+		p.client.Choked = false
+	case message.Choke:
+		p.client.Choked = true
+	case message.Have:
+		index, err := message.ParseHave(msg)
+		if err != nil {
+			return err
+		}
+		p.client.Bitfield.SetPiece(index)
+	case message.Piece:
+		n, err := message.ParsePiece(p.index, p.buf, msg)
+		if err != nil {
+			return err
+		}
+		p.downloaded += n
+		p.backlog--
 	}
 	return nil
 }
